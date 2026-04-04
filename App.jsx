@@ -1,5 +1,5 @@
 import { useEffect, useCallback, useMemo, useRef, useState } from 'react';
-import './AppCSS.css';
+import './App.css';
 import { supabase } from './lib/supabase';
 
 import gooseOneArt from './assets/Rashi-2.png';
