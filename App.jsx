@@ -218,18 +218,74 @@ const flockOptions = [
 ];
 
 // ─── Auth helpers ────────────────────────────────────────────────────────────
-async function sha256hex(str) {
-  const buf = await crypto.subtle.digest(
-    'SHA-256',
-    new TextEncoder().encode(str)
+// ─── Photo storage ───────────────────────────────────────────────────────────
+const PHOTO_BUCKET = 'place-photos';
+const SIGNED_URL_SECONDS = 60 * 60 * 24; // links stay valid for a day
+
+const safeFileName = (name) => name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(-80);
+
+// Uploads new photos for a place and records them in place_photos.
+// Returns the photo objects with their storage path attached.
+async function uploadPlacePhotos({ photos, flockId, placeId, userId }) {
+  const uploaded = await Promise.all(
+    photos.map(async (photo) => {
+      const path = `${flockId}/${placeId}/${crypto.randomUUID()}-${safeFileName(photo.name)}`;
+      const { error } = await supabase.storage
+        .from(PHOTO_BUCKET)
+        .upload(path, photo.file, { contentType: photo.file.type });
+      if (error) throw error;
+      return { ...photo, path };
+    })
   );
-  return Array.from(new Uint8Array(buf))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
+
+  if (uploaded.length > 0) {
+    const { error } = await supabase.from('place_photos').insert(
+      uploaded.map((p) => ({
+        place_id: placeId,
+        path: p.path,
+        file_name: p.name,
+        uploaded_by: userId,
+      }))
+    );
+    if (error) throw error;
+  }
+  return uploaded;
+}
+
+// Supabase Auth needs an email, so usernames map to a fake one.
+// "Confirm email" must be OFF in Supabase → Authentication → Providers → Email.
+const EMAIL_DOMAIN = 'gaggle.local';
+const usernameToEmail = (u) => `${u.trim().toLowerCase()}@${EMAIL_DOMAIN}`;
+
+function validateUsername(u) {
+  if (!/^[a-zA-Z0-9_.-]{3,20}$/.test(u.trim()))
+    return 'Username must be 3–20 characters: letters, numbers, _ . -';
+  return null;
+}
+
+// Loads the signed-in person's profile row + flock (RLS only returns their own flock).
+async function loadProfile(authId) {
+  const { data: user, error } = await supabase
+    .from('users').select('*').eq('auth_id', authId).single();
+  if (error || !user) return null;
+
+  let flock = null;
+  if (user.flock_id) {
+    const { data } = await supabase
+      .from('flocks').select('*').eq('id', user.flock_id).single();
+    flock = data;
+  }
+
+  return {
+    user,
+    avatar: avatarOptions.find((a) => a.id === user.avatar_id) || avatarOptions[0],
+    role:   roleOptions.find((r) => r.id === user.role)        || roleOptions[0],
+    flock,
+  };
 }
 
 function validatePassword(pw) {
-  if (pw.length < 12) return 'Password must be at least 12 characters.';
+  if (pw.length < 8) return 'Password must be at least 8 characters.';
   if (!/[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>/?]/.test(pw))
     return 'Password must include at least 1 special character.';
   return null;
@@ -247,56 +303,42 @@ function SignInScreen({ onSignIn }) {
   const [avatar, setAvatar]       = useState(null);
   const [role, setRole]           = useState(null);
   const [flocks, setFlocks]       = useState([]);
-  const [flockMembers, setFlockMembers] = useState({});
   const [flockLoading, setFlockLoading] = useState(false);
 
-  // Fetch live flocks + members when we reach that step
+  // Fetch flock previews (name + member count + up to 4 avatars) via RPC,
+  // since anonymous visitors can no longer read the users table directly.
   useEffect(() => {
     if (step !== 'signup_flock') return;
     setFlockLoading(true);
     (async () => {
-      const { data: flockData } = await supabase
-        .from('flocks').select('*').order('name');
-      const { data: memberData } = await supabase
-        .from('users').select('id, username, avatar_id, flock_id');
-      const byFlock = {};
-      (memberData || []).forEach((u) => {
-        if (!u.flock_id) return;
-        if (!byFlock[u.flock_id]) byFlock[u.flock_id] = [];
-        byFlock[u.flock_id].push(u);
-      });
-      setFlocks(flockData || []);
-      setFlockMembers(byFlock);
+      const { data, error } = await supabase.rpc('flock_previews');
+      if (error) setAuthError(error.message);
+      setFlocks(data || []);
       setFlockLoading(false);
     })();
   }, [step]);
 
-  // ── Sign in: verify against DB
+  // ── Sign in: Supabase Auth
   const handleSignIn = async (e) => {
     e.preventDefault();
     if (!username.trim() || !password) return;
     setLoading(true); setAuthError('');
     try {
-      const hash = await sha256hex(password);
-      const { data, error } = await supabase
-        .from('users').select('*').eq('username', username.trim()).single();
-      if (error || !data) {
-        setAuthError('No account found with that username.');
+      const { data, error } = await supabase.auth.signInWithPassword({
+        email: usernameToEmail(username),
+        password,
+      });
+      if (error) {
+        setAuthError('Wrong username or password.');
         setLoading(false); return;
       }
-      if (data.password_hash !== hash) {
-        setAuthError('Incorrect password.');
+      const profile = await loadProfile(data.user.id);
+      if (!profile) {
+        setAuthError('Signed in, but no Gaggle profile is linked to this account.');
+        await supabase.auth.signOut();
         setLoading(false); return;
       }
-      let flock = null;
-      if (data.flock_id) {
-        const { data: flockRow } = await supabase
-          .from('flocks').select('*').eq('id', data.flock_id).single();
-        flock = flockRow;
-      }
-      const avatarObj = avatarOptions.find((a) => a.id === data.avatar_id) || avatarOptions[0];
-      const roleObj   = roleOptions.find((r) => r.id === data.role) || roleOptions[0];
-      onSignIn({ user: data, avatar: avatarObj, role: roleObj, flock });
+      onSignIn(profile);
     } catch (err) {
       setAuthError('Something went wrong. Try again.');
     }
@@ -306,20 +348,19 @@ function SignInScreen({ onSignIn }) {
   // ── Sign-up step 1: validate credentials
   const handleCredentialsNext = async (e) => {
     e.preventDefault();
-    if (!username.trim()) { setPwError('Username is required.'); return; }
+    const uErr = validateUsername(username);
+    if (uErr) { setPwError(uErr); return; }
     const err = validatePassword(password);
     if (err) { setPwError(err); return; }
 
     // Check username availability before going any further
     setLoading(true);
-    const { data: existing } = await supabase
-      .from('users')
-      .select('id')
-      .eq('username', username.trim())
-      .maybeSingle();
+    const { data: available, error } = await supabase
+      .rpc('username_available', { p_username: username.trim() });
     setLoading(false);
 
-    if (existing) {
+    if (error) { setPwError(error.message); return; }
+    if (!available) {
       setPwError('That username is already taken — try a different one.');
       return;
     }
@@ -328,25 +369,32 @@ function SignInScreen({ onSignIn }) {
     setStep('signup_avatar');
   };
 
-  // ── Sign-up step 4: create user in DB then enter app
+  // ── Sign-up step 4: create auth account + profile row, then enter app
   const handleFlockPick = async (flock) => {
     setLoading(true); setAuthError('');
     try {
-      const { data: existing } = await supabase
-        .from('users').select('id').eq('username', username.trim()).maybeSingle();
-      if (existing) {
-        setAuthError('That username is already taken. Go back and choose another.');
-        setLoading(false); return;
+      const { data: authData, error: signUpError } = await supabase.auth.signUp({
+        email: usernameToEmail(username),
+        password,
+      });
+      if (signUpError) {
+        if (/registered/i.test(signUpError.message)) {
+          throw new Error('That username is already taken. Go back and choose another.');
+        }
+        throw signUpError;
       }
-      const hash = await sha256hex(password);
+      if (!authData.session) {
+        throw new Error('Account created but not signed in — turn off "Confirm email" in Supabase Auth settings.');
+      }
+
       const { data: newUser, error: insertError } = await supabase
         .from('users')
         .insert({
-          username:      username.trim(),
-          password_hash: hash,
-          avatar_id:     avatar?.id || 'a1',
-          role:          role?.id   || 'waddler',
-          flock_id:      flock.id,
+          auth_id:   authData.user.id,
+          username:  username.trim(),
+          avatar_id: avatar?.id || 'a1',
+          role:      role?.id   || 'waddler',
+          flock_id:  flock.id,
         })
         .select().single();
       if (insertError) throw insertError;
@@ -446,7 +494,7 @@ function SignInScreen({ onSignIn }) {
             <span>Password</span>
             <input
               type="password"
-              placeholder="At least 12 chars + 1 special character"
+              placeholder="At least 8 chars + 1 special character"
               value={password}
               onChange={(e) => { setPassword(e.target.value); setPwError(''); }}
             />
@@ -563,7 +611,8 @@ function SignInScreen({ onSignIn }) {
         ) : (
           <div className="flock-picker">
             {flocks.map((flock) => {
-              const members = flockMembers[flock.id] || [];
+              const memberCount = flock.member_count || 0;
+              const avatarIds   = flock.avatar_ids || [];
               return (
                 <button
                   key={flock.id}
@@ -577,23 +626,23 @@ function SignInScreen({ onSignIn }) {
                     <span className="flock-option-name">{flock.name}</span>
                     <span className="flock-option-desc">{flock.description}</span>
                     <span className="flock-option-members">
-                      {members.length === 0 ? 'No members yet'
-                        : `${members.length} member${members.length === 1 ? '' : 's'}`}
+                      {memberCount === 0 ? 'No members yet'
+                        : `${memberCount} member${memberCount === 1 ? '' : 's'}`}
                     </span>
                   </div>
-                  {members.length > 0 && (
+                  {memberCount > 0 && (
                     <div className="flock-option-avatars">
-                      {members.slice(0, 4).map((m) => {
-                        const av = avatarOptions.find((a) => a.id === m.avatar_id) || avatarOptions[0];
+                      {avatarIds.map((avatarId, i) => {
+                        const av = avatarOptions.find((a) => a.id === avatarId) || avatarOptions[0];
                         return (
-                          <div key={m.id} className="flock-option-avatar">
-                            <img src={av.art} alt={m.username} draggable="false" />
+                          <div key={`${avatarId}-${i}`} className="flock-option-avatar">
+                            <img src={av.art} alt="flock member" draggable="false" />
                           </div>
                         );
                       })}
-                      {members.length > 4 && (
+                      {memberCount > 4 && (
                         <div className="flock-option-avatar flock-option-avatar--overflow">
-                          +{members.length - 4}
+                          +{memberCount - 4}
                         </div>
                       )}
                     </div>
@@ -613,12 +662,29 @@ export default function App() {
   // 'loading' → 'signin' → 'app'
   // Order: signin → loading → app
   // Loading plays AFTER sign-in so the browser autoplay policy is satisfied
-  const [appScreen, setAppScreen] = useState('signin');
+  // 'checking' = looking for an existing Supabase session on page load
+  const [appScreen, setAppScreen] = useState('checking');
   const [currentUser, setCurrentUser] = useState(null);
   const handleLoadingDone = useCallback(() => setAppScreen('app'), []);
   const handleSignIn = useCallback((userData) => {
     setCurrentUser(userData);
     setAppScreen('loading'); // play loading screen after sign-in click
+  }, []);
+
+  // Restore session on refresh so people stay signed in
+  useEffect(() => {
+    (async () => {
+      const { data } = await supabase.auth.getSession();
+      if (data.session) {
+        const profile = await loadProfile(data.session.user.id);
+        if (profile) {
+          setCurrentUser(profile);
+          setAppScreen('app');
+          return;
+        }
+      }
+      setAppScreen('signin');
+    })();
   }, []);
 
   const [menuOpen, setMenuOpen] = useState(false);
@@ -627,7 +693,6 @@ export default function App() {
   const [savedPlaces, setSavedPlaces] = useState([]);
   const [selectedPlace, setSelectedPlace] = useState(null);
 
-  const [geeseRows, setGeeseRows] = useState([]);
   const [leaderboardRows, setLeaderboardRows] = useState([]);
   const [leaderboardLoading, setLeaderboardLoading] = useState(false);
   const [placesLoading, setPlacesLoading] = useState(false);
@@ -693,16 +758,6 @@ export default function App() {
     if (!error && data) setFlockMembers(data);
   }, [currentUser]);
 
-  // Old geese lookup (kept for backward compat with existing place_people rows)
-  const gooseIdByUiName = useMemo(() => {
-    const lookup = {};
-    geeseRows.forEach((goose) => {
-      const uiName = uiGooseNameMap[goose.name];
-      if (uiName) lookup[uiName] = goose.id;
-    });
-    return lookup;
-  }, [geeseRows]);
-
   // New users lookup: username -> user.id (for flock members)
   const userIdByName = useMemo(() => {
     const lookup = {};
@@ -726,131 +781,52 @@ export default function App() {
     setMenuOpen(false);
   };
 
-  const fetchGeese = async () => {
-    const { data, error } = await supabase.from('geese').select('*').order('name');
-    if (error) {
-      setDbMessage(error.message);
-      return;
-    }
-    setGeeseRows(data || []);
+  const handleSignOut = async () => {
+    await supabase.auth.signOut();
+    setCurrentUser(null);
+    setFlockMembers([]);
+    setSavedPlaces([]);
+    setLeaderboardRows([]);
+    setSelectedPlace(null);
+    setActiveTab('Home');
+    setMenuOpen(false);
+    setAppScreen('signin');
   };
 
+  // All places for the current flock, with tagged people embedded.
+  // RLS also enforces the flock scope server-side.
   const fetchSavedPlaces = async () => {
+    if (!currentUser?.flock?.id) return;
     setPlacesLoading(true);
 
-    // Snapshot flock member IDs for this fetch
-    const flockUserIds = new Set(flockMembers.map((m) => m.id));
-    const userNameSnap = {};
-    flockMembers.forEach((m) => { userNameSnap[m.id] = m.username; });
-    const hasFlockFilter = flockUserIds.size > 0;
-
-    // Step 1: fetch only place_people rows for THIS flock's members.
-    // This means no other flock's places can ever leak in.
-    let flockPlaceIds = null;
-    if (hasFlockFilter) {
-      const flockIdList = Array.from(flockUserIds);
-      const { data: flockTagRows, error: flockTagError } = await supabase
-        .from('place_people')
-        .select('place_id, goose_id')
-        .in('goose_id', flockIdList);
-
-      if (flockTagError) {
-        setDbMessage(flockTagError.message);
-        setPlacesLoading(false);
-        return;
-      }
-
-      // Build place → people map strictly from this flock's rows only
-      const peopleByPlaceId = {};
-      (flockTagRows || []).forEach((row) => {
-        const name = userNameSnap[row.goose_id];
-        if (!name) return;
-        if (!peopleByPlaceId[row.place_id]) peopleByPlaceId[row.place_id] = [];
-        peopleByPlaceId[row.place_id].push(name);
-      });
-
-      flockPlaceIds = Object.keys(peopleByPlaceId);
-
-      // If no places at all yet for this flock, return empty immediately
-      if (flockPlaceIds.length === 0) {
-        setSavedPlaces([]);
-        setPlacesLoading(false);
-        return;
-      }
-
-      // Step 2: fetch only the places that belong to this flock
-      const { data: placesData, error: placesError } = await supabase
-        .from('places')
-        .select('*')
-        .in('id', flockPlaceIds)
-        .order('id', { ascending: false });
-
-      if (placesError) {
-        setDbMessage(placesError.message);
-        setPlacesLoading(false);
-        return;
-      }
-
-      const normalizedPlaces = (placesData || []).map((place) => ({
-        id: `db-${place.id}`,
-        dbId: place.id,
-        name: place.name || '',
-        review: place.review || '',
-        rating: place.rating || 0,
-        relX: place.rel_x,
-        relY: place.rel_y,
-        pixelX: null,
-        pixelY: null,
-        relXPercent: place.rel_x != null ? `${(place.rel_x * 100).toFixed(1)}%` : '',
-        relYPercent: place.rel_y != null ? `${(place.rel_y * 100).toFixed(1)}%` : '',
-        people: peopleByPlaceId[place.id] || [],
-        photos: [],
-        fileName: '',
-        placeType: place.place_type || 'cafe',
-      }));
-
-      setSavedPlaces(normalizedPlaces);
-      setPlacesLoading(false);
-      return;
-    }
-
-    // ── Fallback: not signed in — fetch all places with old geese lookup ──
-    const { data: placesData, error: placesError } = await supabase
+    const { data, error } = await supabase
       .from('places')
-      .select('*')
+      .select('*, place_people(goose_id), place_photos(id, path, file_name)')
+      .eq('flock_id', currentUser.flock.id)
       .order('id', { ascending: false });
 
-    if (placesError) {
-      setDbMessage(placesError.message);
+    if (error) {
+      setDbMessage(error.message);
       setPlacesLoading(false);
       return;
     }
 
-    const { data: taggedPeopleRows, error: taggedPeopleError } = await supabase
-      .from('place_people')
-      .select('place_id, goose_id');
-
-    if (taggedPeopleError) {
-      setDbMessage(taggedPeopleError.message);
-      setPlacesLoading(false);
-      return;
+    // One batch request for every photo's temporary link
+    const allPaths = (data || []).flatMap((place) =>
+      (place.place_photos || []).map((photo) => photo.path)
+    );
+    const urlByPath = {};
+    if (allPaths.length > 0) {
+      const { data: signed, error: signError } = await supabase.storage
+        .from(PHOTO_BUCKET)
+        .createSignedUrls(allPaths, SIGNED_URL_SECONDS);
+      if (signError) setDbMessage(signError.message);
+      (signed || []).forEach((item) => {
+        if (item.signedUrl) urlByPath[item.path] = item.signedUrl;
+      });
     }
 
-    const gooseNameById = {};
-    geeseRows.forEach((goose) => {
-      const uiName = uiGooseNameMap[goose.name];
-      if (uiName) gooseNameById[goose.id] = uiName;
-    });
-
-    const peopleByPlaceId = {};
-    (taggedPeopleRows || []).forEach((row) => {
-      const name = gooseNameById[row.goose_id];
-      if (!name) return;
-      if (!peopleByPlaceId[row.place_id]) peopleByPlaceId[row.place_id] = [];
-      peopleByPlaceId[row.place_id].push(name);
-    });
-
-    const normalizedPlaces = (placesData || []).map((place) => ({
+    const normalizedPlaces = (data || []).map((place) => ({
       id: `db-${place.id}`,
       dbId: place.id,
       name: place.name || '',
@@ -862,8 +838,18 @@ export default function App() {
       pixelY: null,
       relXPercent: place.rel_x != null ? `${(place.rel_x * 100).toFixed(1)}%` : '',
       relYPercent: place.rel_y != null ? `${(place.rel_y * 100).toFixed(1)}%` : '',
-      people: peopleByPlaceId[place.id] || [],
-      photos: [],
+      people: (place.place_people || [])
+        .map((row) => usernameById[row.goose_id])
+        .filter(Boolean),
+      photos: (place.place_photos || [])
+        .sort((a, b) => a.id - b.id)
+        .filter((photo) => urlByPath[photo.path])
+        .map((photo) => ({
+          id: `photo-${photo.id}`,
+          name: photo.file_name || 'photo',
+          path: photo.path,
+          url: urlByPath[photo.path],
+        })),
       fileName: '',
       placeType: place.place_type || 'cafe',
     }));
@@ -873,76 +859,39 @@ export default function App() {
   };
 
   const fetchLeaderboard = async () => {
+    if (!currentUser?.flock?.id) return;
     setLeaderboardLoading(true);
 
-    // If signed in, show only flock members ranked by points.
-    // Falls back to the old goose_leaderboard view when not signed in.
-    if (currentUser?.flock?.id) {
-      const { data, error } = await supabase
-        .from('flock_leaderboard')
-        .select('*')
-        .eq('flock_id', currentUser.flock.id)
-        .order('total_points', { ascending: false })
-        .order('places_visited', { ascending: false });
+    const { data, error } = await supabase
+      .from('flock_leaderboard')
+      .select('*')
+      .eq('flock_id', currentUser.flock.id)
+      .order('total_points', { ascending: false })
+      .order('places_visited', { ascending: false });
 
-      if (error) {
-        setDbMessage(error.message);
-        setLeaderboardLoading(false);
-        return;
-      }
-      setLeaderboardRows(data || []);
-    } else {
-      const { data, error } = await supabase
-        .from('goose_leaderboard')
-        .select('*')
-        .order('total_points', { ascending: false })
-        .order('places_visited', { ascending: false });
-
-      if (error) {
-        setDbMessage(error.message);
-        setLeaderboardLoading(false);
-        return;
-      }
-      setLeaderboardRows(data || []);
-    }
+    if (error) setDbMessage(error.message);
+    else setLeaderboardRows(data || []);
 
     setLeaderboardLoading(false);
   };
 
-  useEffect(() => {
-    fetchGeese();
-    fetchLeaderboard();
-  }, []);
-
-  // Runs whenever currentUser is set (right after sign-in) to reload flock data
+  // Runs whenever currentUser is set (sign-in or restored session)
   useEffect(() => {
     fetchFlockMembers();
     fetchLeaderboard();
   }, [fetchFlockMembers]);
 
-  // Re-fetch saved places once flock members are known so filter + name resolution works
+  // Load places once flock members are known so names resolve
   useEffect(() => {
-    if (flockMembers.length > 0) {
-      fetchSavedPlaces();
-    }
+    if (flockMembers.length > 0) fetchSavedPlaces();
   }, [flockMembers]);
-
-  useEffect(() => {
-    if (geeseRows.length > 0) {
-      fetchSavedPlaces();
-    }
-  }, [geeseRows]);
 
   const handleSavePlace = async (placeData) => {
     try {
       setDbMessage('');
-      // Use the signed-in user's own ID as creator if available,
-      // otherwise fall back to resolving the first tagged person's old goose ID.
-      const creatorId = currentUser?.user?.id
-        || (() => {
-          const firstName = placeData.people?.[0] || null;
-          return firstName ? (userIdByName[firstName] || gooseIdByUiName[firstName] || null) : null;
-        })();
+      const creatorId = currentUser?.user?.id;
+      const flockId   = currentUser?.flock?.id;
+      if (!creatorId || !flockId) throw new Error('You need to be signed in to a flock to save places.');
 
       const { data: insertedPlace, error: placeError } = await supabase
         .from('places')
@@ -954,34 +903,48 @@ export default function App() {
           rel_y: placeData.relY,
           photo_count: placeData.photos?.length || 0,
           place_type: placeData.placeType || 'cafe',
-          created_by_goose_id: creatorId,   // signed-in user's ID for +10 pts
+          created_by_goose_id: creatorId,
+          flock_id: flockId,
         })
         .select()
         .single();
 
       if (placeError) throw placeError;
 
-      // Build tagged rows from selected people
+      // Tagged flockmates + always the creator (so they get points)
       const taggedIds = new Set(
-        (placeData.people || [])
-          .map((name) => userIdByName[name] || gooseIdByUiName[name])
-          .filter(Boolean)
+        (placeData.people || []).map((name) => userIdByName[name]).filter(Boolean)
       );
-
-      // Always include the creator so they get points even if they didn't tag themselves
-      if (creatorId) taggedIds.add(creatorId);
+      taggedIds.add(creatorId);
 
       const taggedRows = Array.from(taggedIds)
         .map((id) => ({ place_id: insertedPlace.id, goose_id: id }));
 
-      if (taggedRows.length > 0) {
-        const { error: peopleError } = await supabase.from('place_people').insert(taggedRows);
-        if (peopleError) throw peopleError;
+      const { error: peopleError } = await supabase.from('place_people').insert(taggedRows);
+      if (peopleError) throw peopleError;
+
+      // Upload photos. If this fails the place is still saved — just warn.
+      let savedPhotos = placeData.photos || [];
+      try {
+        savedPhotos = await uploadPlacePhotos({
+          photos: savedPhotos,
+          flockId,
+          placeId: insertedPlace.id,
+          userId: creatorId,
+        });
+      } catch (photoError) {
+        setDbMessage(`Place saved, but photos failed to upload: ${photoError.message}`);
       }
 
+      const creatorName = currentUser.user.username;
       const savedPlaceWithDbId = {
         ...placeData,
+        id: `db-${insertedPlace.id}`,
         dbId: insertedPlace.id,
+        photos: savedPhotos,
+        people: placeData.people?.includes(creatorName)
+          ? placeData.people
+          : [...(placeData.people || []), creatorName],
         placeType: placeData.placeType || 'cafe',
       };
 
@@ -1031,6 +994,13 @@ export default function App() {
       setDeletingPlaceId(place.dbId || place.id);
 
       if (place.dbId) {
+        // Storage files aren't removed by the DB cascade — delete them first
+        const paths = (place.photos || []).map((p) => p.path).filter(Boolean);
+        if (paths.length > 0) {
+          const { error: storageError } = await supabase.storage.from(PHOTO_BUCKET).remove(paths);
+          if (storageError) throw storageError;
+        }
+
         const { error: junctionError } = await supabase
           .from('place_people')
           .delete()
@@ -1122,6 +1092,7 @@ export default function App() {
     setSearchText('');
   };
 
+  if (appScreen === 'checking') return null;
   if (appScreen === 'loading') return <LoadingScreen onDone={handleLoadingDone} />;
   if (appScreen === 'signin') return <SignInScreen onSignIn={handleSignIn} />;
 
@@ -1189,6 +1160,9 @@ export default function App() {
                   {item}
                 </button>
               ))}
+              <button type="button" className="dropdown-item" onClick={handleSignOut}>
+                Sign out
+              </button>
             </nav>
           )}
         </div>
@@ -1466,11 +1440,19 @@ function MapWrapped({ savedPlaces = [] }) {
   const containerRef = useRef(null);
   const [dims, setDims] = useState({ width: 600, height: 480 });
 
+  // Oldest → newest, so "Start" is the first place and "Latest" the newest
+  const places = useMemo(
+    () => savedPlaces
+      .filter((p) => p.relX != null && p.relY != null)
+      .sort((a, b) => (a.dbId ?? 0) - (b.dbId ?? 0)),
+    [savedPlaces]
+  );
+
   useEffect(() => {
     const measure = () => {
       if (containerRef.current) {
         const { width } = containerRef.current.getBoundingClientRect();
-        const n = savedPlaces.filter((p) => p.relX != null).length;
+        const n = places.length;
         // Give more vertical room the more places there are
         const minH = Math.max(420, width * 0.62, n * 90);
         setDims({ width, height: minH });
@@ -1479,9 +1461,7 @@ function MapWrapped({ savedPlaces = [] }) {
     measure();
     window.addEventListener('resize', measure);
     return () => window.removeEventListener('resize', measure);
-  }, []);
-
-  const places = savedPlaces.filter((p) => p.relX != null && p.relY != null);
+  }, [places.length]);
 
   if (places.length === 0) {
     return (
@@ -1619,8 +1599,9 @@ function MapWrapped({ savedPlaces = [] }) {
 
         {/* Stops */}
         {places.map((place, i) => {
-          const x   = cx(place.relX);
-          const y   = cy(place.relY);
+          // Use the spread-out position so dots line up with the trail
+          const x   = pts[i].x;
+          const y   = pts[i].y;
           const dt  = getDot(i, places.length);
           const art = (placeTypeOptions.find((o) => o.value === place.placeType) || placeTypeOptions[0]).art;
           const raw = place.name || 'Untitled';
