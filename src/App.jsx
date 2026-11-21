@@ -674,14 +674,18 @@ export default function App() {
   // Restore session on refresh so people stay signed in
   useEffect(() => {
     (async () => {
-      const { data } = await supabase.auth.getSession();
-      if (data.session) {
-        const profile = await loadProfile(data.session.user.id);
-        if (profile) {
-          setCurrentUser(profile);
-          setAppScreen('app');
-          return;
+      try {
+        const { data } = await supabase.auth.getSession();
+        if (data.session) {
+          const profile = await loadProfile(data.session.user.id);
+          if (profile) {
+            setCurrentUser(profile);
+            setAppScreen('app');
+            return;
+          }
         }
+      } catch (err) {
+        console.error('Session check failed:', err);
       }
       setAppScreen('signin');
     })();
@@ -803,7 +807,7 @@ export default function App() {
       .from('places')
       .select('*, place_people(goose_id), place_photos(id, path, file_name)')
       .eq('flock_id', currentUser.flock.id)
-      .order('id', { ascending: false });
+      .order('created_at', { ascending: false });
 
     if (error) {
       setDbMessage(error.message);
@@ -829,6 +833,7 @@ export default function App() {
     const normalizedPlaces = (data || []).map((place) => ({
       id: `db-${place.id}`,
       dbId: place.id,
+      createdAt: place.created_at,
       name: place.name || '',
       review: place.review || '',
       rating: place.rating || 0,
@@ -941,6 +946,7 @@ export default function App() {
         ...placeData,
         id: `db-${insertedPlace.id}`,
         dbId: insertedPlace.id,
+        createdAt: insertedPlace.created_at,
         photos: savedPhotos,
         people: placeData.people?.includes(creatorName)
           ? placeData.people
@@ -1444,7 +1450,7 @@ function MapWrapped({ savedPlaces = [] }) {
   const places = useMemo(
     () => savedPlaces
       .filter((p) => p.relX != null && p.relY != null)
-      .sort((a, b) => (a.dbId ?? 0) - (b.dbId ?? 0)),
+      .sort((a, b) => String(a.createdAt ?? '').localeCompare(String(b.createdAt ?? ''))),
     [savedPlaces]
   );
 
