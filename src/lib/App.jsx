@@ -292,6 +292,29 @@ function validatePassword(pw) {
 }
 
 // ─── SignInScreen ────────────────────────────────────────────────────────────
+const FLOCK_EMOJIS = ['🪿', '🌿', '☕', '🍕', '🌊', '⛰️', '🎒', '✨'];
+
+// Creates the auth account — or, if an earlier attempt already created it
+// but failed before the profile was made, signs back into it.
+async function ensureAuthSession(email, password) {
+  const { data: existing } = await supabase.auth.getSession();
+  if (existing.session?.user?.email === email) return existing.session;
+
+  const { data, error } = await supabase.auth.signUp({ email, password });
+  if (error) {
+    if (/registered/i.test(error.message)) {
+      const { data: si, error: siErr } = await supabase.auth.signInWithPassword({ email, password });
+      if (siErr) throw new Error('That username is already taken. Go back and choose another.');
+      return si.session;
+    }
+    throw error;
+  }
+  if (!data.session) {
+    throw new Error('Account created but not signed in — turn off "Confirm email" in Supabase Auth settings.');
+  }
+  return data.session;
+}
+
 // step: 'signin' | 'signup_creds' | 'signup_avatar' | 'signup_role' | 'signup_flock'
 function SignInScreen({ onSignIn }) {
   const [step, setStep]           = useState('signin');
@@ -302,21 +325,10 @@ function SignInScreen({ onSignIn }) {
   const [loading, setLoading]     = useState(false);
   const [avatar, setAvatar]       = useState(null);
   const [role, setRole]           = useState(null);
-  const [flocks, setFlocks]       = useState([]);
-  const [flockLoading, setFlockLoading] = useState(false);
-
-  // Fetch flock previews (name + member count + up to 4 avatars) via RPC,
-  // since anonymous visitors can no longer read the users table directly.
-  useEffect(() => {
-    if (step !== 'signup_flock') return;
-    setFlockLoading(true);
-    (async () => {
-      const { data, error } = await supabase.rpc('flock_previews');
-      if (error) setAuthError(error.message);
-      setFlocks(data || []);
-      setFlockLoading(false);
-    })();
-  }, [step]);
+  const [flockMode, setFlockMode]   = useState('create'); // 'create' | 'join'
+  const [flockName, setFlockName]   = useState('');
+  const [flockEmoji, setFlockEmoji] = useState(FLOCK_EMOJIS[0]);
+  const [inviteCode, setInviteCode] = useState('');
 
   // ── Sign in: Supabase Auth
   const handleSignIn = async (e) => {
@@ -369,40 +381,41 @@ function SignInScreen({ onSignIn }) {
     setStep('signup_avatar');
   };
 
-  // ── Sign-up step 4: create auth account + profile row, then enter app
-  const handleFlockPick = async (flock) => {
+  // ── Sign-up step 4: create auth account, then profile + flock in one step
+  const finishSignup = async (rpcName, extraArgs) => {
     setLoading(true); setAuthError('');
     try {
-      const { data: authData, error: signUpError } = await supabase.auth.signUp({
-        email: usernameToEmail(username),
-        password,
+      await ensureAuthSession(usernameToEmail(username), password);
+      const { data, error } = await supabase.rpc(rpcName, {
+        p_username:  username.trim(),
+        p_avatar_id: avatar?.id || 'a1',
+        p_role:      role?.id   || 'waddler',
+        ...extraArgs,
       });
-      if (signUpError) {
-        if (/registered/i.test(signUpError.message)) {
-          throw new Error('That username is already taken. Go back and choose another.');
-        }
-        throw signUpError;
-      }
-      if (!authData.session) {
-        throw new Error('Account created but not signed in — turn off "Confirm email" in Supabase Auth settings.');
-      }
-
-      const { data: newUser, error: insertError } = await supabase
-        .from('users')
-        .insert({
-          auth_id:   authData.user.id,
-          username:  username.trim(),
-          avatar_id: avatar?.id || 'a1',
-          role:      role?.id   || 'waddler',
-          flock_id:  flock.id,
-        })
-        .select().single();
-      if (insertError) throw insertError;
-      onSignIn({ user: newUser, avatar, role, flock });
+      if (error) throw error;
+      onSignIn({ user: data.user, avatar, role, flock: data.flock });
     } catch (err) {
       setAuthError(err.message || 'Failed to create account.');
     }
     setLoading(false);
+  };
+
+  const handleCreateFlock = (e) => {
+    e.preventDefault();
+    if (!flockName.trim()) return;
+    finishSignup('create_profile_new_flock', {
+      p_flock_name:  flockName.trim(),
+      p_flock_emoji: flockEmoji,
+    });
+  };
+
+  const handleJoinFlock = (e) => {
+    e.preventDefault();
+    if (inviteCode.trim().length !== 6) {
+      setAuthError('Invite codes are 6 characters.');
+      return;
+    }
+    finishSignup('create_profile_join_flock', { p_invite_code: inviteCode.trim() });
   };
 
   // ── Shared header geese
@@ -595,63 +608,96 @@ function SignInScreen({ onSignIn }) {
     </div>
   );
 
-  // ———————————————————————— SIGN UP — STEP 4: flock (live from DB)
+  // ———————————————————————— SIGN UP — STEP 4: create or join a flock
   return (
     <div className="signin-screen">
       <div className="signin-card">
         <HeaderGeese />
         <p className="signup-step-label">Step 4 of 4</p>
-        <h1 className="signin-title">Join a flock</h1>
-        <p className="signin-sub">Pick the crew you’re flying with</p>
+        <h1 className="signin-title">Your flock</h1>
+        <p className="signin-sub">Start a new one, or join friends with their code</p>
+
+        <div className="flock-mode-toggle" role="tablist">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={flockMode === 'create'}
+            className={`flock-mode-btn ${flockMode === 'create' ? 'active' : ''}`}
+            onClick={() => { setFlockMode('create'); setAuthError(''); }}
+          >
+            Create a flock
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={flockMode === 'join'}
+            className={`flock-mode-btn ${flockMode === 'join' ? 'active' : ''}`}
+            onClick={() => { setFlockMode('join'); setAuthError(''); }}
+          >
+            Join with a code
+          </button>
+        </div>
 
         {authError && <p className="signup-field-error" style={{ marginBottom: 8 }}>{authError}</p>}
 
-        {flockLoading ? (
-          <p className="signin-sub" style={{ marginTop: 16 }}>Loading flocks…</p>
+        {flockMode === 'create' ? (
+          <form className="signin-form" onSubmit={handleCreateFlock}>
+            <label className="signin-field">
+              <span>Flock name</span>
+              <input
+                type="text"
+                value={flockName}
+                onChange={(e) => setFlockName(e.target.value)}
+                maxLength={40}
+                placeholder="e.g. Dorm 4B Geese"
+                autoFocus
+              />
+            </label>
+
+            <div className="signin-field">
+              <span>Pick an emoji</span>
+              <div className="flock-emoji-picker">
+                {FLOCK_EMOJIS.map((emoji) => (
+                  <button
+                    key={emoji}
+                    type="button"
+                    className={`flock-emoji-option ${flockEmoji === emoji ? 'selected' : ''}`}
+                    onClick={() => setFlockEmoji(emoji)}
+                    aria-label={`Use ${emoji}`}
+                  >
+                    {emoji}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <button type="submit" className="signin-button" disabled={loading || !flockName.trim()}>
+              {loading ? 'Creating…' : 'Create flock'}
+            </button>
+          </form>
         ) : (
-          <div className="flock-picker">
-            {flocks.map((flock) => {
-              const memberCount = flock.member_count || 0;
-              const avatarIds   = flock.avatar_ids || [];
-              return (
-                <button
-                  key={flock.id}
-                  type="button"
-                  className="flock-option"
-                  disabled={loading}
-                  onClick={() => handleFlockPick(flock)}
-                >
-                  <span className="flock-option-emoji">{flock.emoji}</span>
-                  <div className="flock-option-copy">
-                    <span className="flock-option-name">{flock.name}</span>
-                    <span className="flock-option-desc">{flock.description}</span>
-                    <span className="flock-option-members">
-                      {memberCount === 0 ? 'No members yet'
-                        : `${memberCount} member${memberCount === 1 ? '' : 's'}`}
-                    </span>
-                  </div>
-                  {memberCount > 0 && (
-                    <div className="flock-option-avatars">
-                      {avatarIds.map((avatarId, i) => {
-                        const av = avatarOptions.find((a) => a.id === avatarId) || avatarOptions[0];
-                        return (
-                          <div key={`${avatarId}-${i}`} className="flock-option-avatar">
-                            <img src={av.art} alt="flock member" draggable="false" />
-                          </div>
-                        );
-                      })}
-                      {memberCount > 4 && (
-                        <div className="flock-option-avatar flock-option-avatar--overflow">
-                          +{memberCount - 4}
-                        </div>
-                      )}
-                    </div>
-                  )}
-                  <span className="flock-option-arrow">›</span>
-                </button>
-              );
-            })}
-          </div>
+          <form className="signin-form" onSubmit={handleJoinFlock}>
+            <label className="signin-field">
+              <span>Invite code</span>
+              <input
+                type="text"
+                className="invite-code-input"
+                value={inviteCode}
+                onChange={(e) => setInviteCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ''))}
+                maxLength={6}
+                placeholder="K7Q2MX"
+                autoCapitalize="characters"
+                autoComplete="off"
+                autoFocus
+              />
+            </label>
+            <p className="flock-join-hint">
+              Ask someone in the flock — their code is on their Home tab.
+            </p>
+            <button type="submit" className="signin-button" disabled={loading || inviteCode.length !== 6}>
+              {loading ? 'Joining…' : 'Join flock'}
+            </button>
+          </form>
         )}
       </div>
     </div>
@@ -783,6 +829,19 @@ export default function App() {
   const handleMenuItemClick = (item) => {
     setActiveTab(item);
     setMenuOpen(false);
+  };
+
+  const [inviteCopied, setInviteCopied] = useState(false);
+  const handleCopyInvite = async () => {
+    const code = currentUser?.flock?.invite_code;
+    if (!code) return;
+    try {
+      await navigator.clipboard.writeText(code);
+      setInviteCopied(true);
+      setTimeout(() => setInviteCopied(false), 1500);
+    } catch {
+      // clipboard blocked — the code is still visible to copy by hand
+    }
   };
 
   const handleSignOut = async () => {
@@ -1118,8 +1177,16 @@ export default function App() {
 
           <div className="gaggle-dropdown">
             <p className="gaggle-title">
-              {currentUser?.flock ? currentUser.flock.name : 'The gaggle'}
+              {currentUser?.flock ? `${currentUser.flock.emoji || ''} ${currentUser.flock.name}`.trim() : 'The gaggle'}
             </p>
+            {currentUser?.flock?.invite_code && (
+              <div className="invite-code-row">
+                <span>Invite code</span>
+                <button type="button" className="invite-code-chip" onClick={handleCopyInvite}>
+                  {inviteCopied ? 'Copied!' : currentUser.flock.invite_code}
+                </button>
+              </div>
+            )}
             {displayFlock.map((goose) => (
               <article key={goose.name} className="goose-card">
                 <div className="goose-header">
@@ -1183,6 +1250,14 @@ export default function App() {
               <p className="home-copy">
                 Save places from the map, browse them in the Places tab, open any saved placard back on the map, and view the live leaderboard in Points.
               </p>
+              {currentUser?.flock?.invite_code && (
+                <div className="home-invite">
+                  <span>Invite friends to {currentUser.flock.name} with code</span>
+                  <button type="button" className="invite-code-chip" onClick={handleCopyInvite}>
+                    {inviteCopied ? 'Copied!' : currentUser.flock.invite_code}
+                  </button>
+                </div>
+              )}
             </div>
 
             <div className="home-grid">
